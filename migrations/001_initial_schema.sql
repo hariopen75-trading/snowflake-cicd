@@ -3,7 +3,7 @@
 -- Run order : 001 (first)
 
 
-CREATE TABLE IF NOT EXISTS demo_db.raw.orders (
+CREATE TABLE IF NOT EXISTS DEMO_DB.RAW.orders (
     order_id    NUMBER        NOT NULL,
     customer_id NUMBER,
     product_id  NUMBER,
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS demo_db.raw.orders (
     CONSTRAINT pk_orders PRIMARY KEY (order_id)
 );
 
-CREATE TABLE IF NOT EXISTS demo_db.raw.customers (
+CREATE TABLE IF NOT EXISTS DEMO_DB.RAW.customers (
     customer_id NUMBER        NOT NULL,
     name        VARCHAR(200),
     email       VARCHAR(200),
