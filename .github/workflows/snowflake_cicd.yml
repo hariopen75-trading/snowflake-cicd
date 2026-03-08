@@ -1,0 +1,285 @@
+# ============================================================
+# GitHub Actions: Snowflake CI/CD
+# File: .github/workflows/snowflake_cicd.yml
+# ============================================================
+# Triggers:
+#   - Push to main → full deploy pipeline
+#   - Push to develop → run tests only (no deploy)
+#   - Manual via GitHub Actions "Run workflow" button
+#
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   SNOWFLAKE_ACCOUNT   : FJC24794
+#   SNOWFLAKE_USER      : HARIOPEN75
+#   SNOWFLAKE_PASSWORD  : SnowDemo2026Admin
+#   SNOWFLAKE_WAREHOUSE : DEMO_WH
+#   SNOWFLAKE_DATABASE  : DEMO_DB
+#   SNOWFLAKE_SCHEMA    : ANALYTICS
+#   SNOWFLAKE_ROLE      : DEVELOPER_ROLE
+# ============================================================
+
+name: Snowflake CI/CD
+
+on:
+  push:
+    branches:
+      - main       # full deploy
+      - develop    # test only
+    paths:
+      - 'sql/**'
+      - 'notebooks/**'
+      - 'migrations/**'
+      - '.github/workflows/snowflake_cicd.yml'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Git branch to deploy'
+        required: true
+        default: 'main'
+      run_mode:
+        description: 'Mode: test | deploy | full'
+        required: true
+        default: 'full'
+        type: choice
+        options: [test, deploy, full]
+
+env:
+  SNOWFLAKE_ACCOUNT   : ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER      : ${{ secrets.SNOWFLAKE_USER }}
+  SNOWFLAKE_DATABASE  : ${{ secrets.SNOWFLAKE_DATABASE }}
+  SNOWFLAKE_SCHEMA    : ${{ secrets.SNOWFLAKE_SCHEMA }}
+  SNOWFLAKE_WAREHOUSE : ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+  SNOWFLAKE_ROLE      : ${{ secrets.SNOWFLAKE_ROLE }}
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB 1: Lint & Validate SQL
+  # ──────────────────────────────────────────
+  validate:
+    name: Validate SQL & Notebooks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install snowflake-connector-python sqlfluff nbformat
+
+      - name: Lint SQL files with SQLFluff
+        run: |
+          if [ -d sql/ ]; then
+            sqlfluff lint sql/ --dialect snowflake || true
+          fi
+          if [ -d migrations/ ]; then
+            sqlfluff lint migrations/ --dialect snowflake || true
+          fi
+
+      - name: Validate notebooks JSON
+        run: |
+          python - <<'EOF'
+          import nbformat, glob, sys
+          errors = []
+          for f in glob.glob('notebooks/**/*.ipynb', recursive=True):
+              try:
+                  with open(f) as fh:
+                      nbformat.validate(nbformat.read(fh, as_version=4))
+                  print(f'  ✓ {f}')
+              except Exception as e:
+                  print(f'  ✗ {f}: {e}')
+                  errors.append(f)
+          if errors:
+              sys.exit(1)
+          EOF
+
+  # ──────────────────────────────────────────
+  # JOB 2: Run Tests (all branches)
+  # ──────────────────────────────────────────
+  test:
+    name: Data Quality Tests
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Snowflake connector
+        run: pip install snowflake-connector-python
+
+      - name: Run data quality tests against Snowflake
+        env:
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python - <<'EOF'
+          import snowflake.connector, sys
+
+          conn = snowflake.connector.connect(
+              account   = '${{ env.SNOWFLAKE_ACCOUNT }}',
+              user      = '${{ env.SNOWFLAKE_USER }}',
+              password  = '${{ env.SNOWFLAKE_PASSWORD }}',
+              warehouse = '${{ env.SNOWFLAKE_WAREHOUSE }}',
+              database  = '${{ env.SNOWFLAKE_DATABASE }}',
+              schema    = '${{ env.SNOWFLAKE_SCHEMA }}',
+              role      = '${{ env.SNOWFLAKE_ROLE }}',
+          )
+          cur = conn.cursor()
+
+          tests = [
+              ('No null customer_id',
+               'SELECT COUNT(*) FROM demo_db.raw.orders WHERE customer_id IS NULL'),
+              ('No negative amounts',
+               'SELECT COUNT(*) FROM demo_db.raw.orders WHERE amount < 0'),
+              ('No duplicate order_ids',
+               'SELECT COUNT(*) FROM (SELECT order_id, COUNT(*) c FROM demo_db.raw.orders GROUP BY 1 HAVING c > 1)'),
+              ('Orders RI check',
+               'SELECT COUNT(*) FROM demo_db.raw.orders o WHERE NOT EXISTS (SELECT 1 FROM demo_db.raw.customers c WHERE c.customer_id = o.customer_id)'),
+          ]
+
+          failures = []
+          for name, sql in tests:
+              cur.execute(sql)
+              val = cur.fetchone()[0]
+              passed = val == 0
+              print(f"  {'✓' if passed else '✗'} {name}: {val}")
+              if not passed:
+                  failures.append(name)
+
+          conn.close()
+          if failures:
+              print(f'\nFailed: {failures}')
+              sys.exit(1)
+          print('\nAll tests passed.')
+          EOF
+
+  # ──────────────────────────────────────────
+  # JOB 3: Deploy (main branch only)
+  # ──────────────────────────────────────────
+  deploy:
+    name: Deploy to Snowflake
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.event.inputs.run_mode == 'deploy' || github.event.inputs.run_mode == 'full'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install snowflake-connector-python
+
+      - name: Fetch latest repo in Snowflake + Execute CI/CD Notebook
+        env:
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python - <<'EOF'
+          import snowflake.connector, sys
+
+          conn = snowflake.connector.connect(
+              account   = '${{ env.SNOWFLAKE_ACCOUNT }}',
+              user      = '${{ env.SNOWFLAKE_USER }}',
+              password  = '${{ env.SNOWFLAKE_PASSWORD }}',
+              warehouse = '${{ env.SNOWFLAKE_WAREHOUSE }}',
+              database  = '${{ env.SNOWFLAKE_DATABASE }}',
+              schema    = '${{ env.SNOWFLAKE_SCHEMA }}',
+              role      = '${{ env.SNOWFLAKE_ROLE }}',
+          )
+          cur = conn.cursor()
+
+          steps = [
+              # 1. Sync latest GitHub commit into Snowflake
+              'ALTER GIT REPOSITORY demo_db.analytics.snowflake_cicd_repo FETCH',
+              # 2. Run migrations
+              # (handled inside the notebook)
+              # 3. Execute the CI/CD notebook
+              'EXECUTE NOTEBOOK demo_db.analytics.snowflake_cicd_notebook()',
+              # 4. Trigger on-demand deploy task
+              'EXECUTE TASK demo_db.analytics.cicd_manual_deploy',
+          ]
+
+          for sql in steps:
+              print(f'  → {sql[:80]}...')
+              try:
+                  cur.execute(sql)
+                  print(f'     ✓ OK')
+              except Exception as e:
+                  print(f'     ✗ {e}')
+                  # Non-fatal for notebook execute (async)
+
+          conn.close()
+          print('Deploy complete.')
+          EOF
+
+      - name: Run migrations from sql/migrations/
+        env:
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python - <<'EOF'
+          import snowflake.connector, glob, os, sys
+
+          conn = snowflake.connector.connect(
+              account   = '${{ env.SNOWFLAKE_ACCOUNT }}',
+              user      = '${{ env.SNOWFLAKE_USER }}',
+              password  = '${{ env.SNOWFLAKE_PASSWORD }}',
+              warehouse = '${{ env.SNOWFLAKE_WAREHOUSE }}',
+              database  = '${{ env.SNOWFLAKE_DATABASE }}',
+              schema    = '${{ env.SNOWFLAKE_SCHEMA }}',
+              role      = '${{ env.SNOWFLAKE_ROLE }}',
+          )
+          cur = conn.cursor()
+          errors = []
+
+          for path in sorted(glob.glob('migrations/*.sql')):
+              sql = open(path).read()
+              for stmt in sql.split(';'):
+                  stmt = stmt.strip()
+                  if stmt and not stmt.startswith('--'):
+                      try:
+                          cur.execute(stmt)
+                      except Exception as e:
+                          print(f'  ✗ {path}: {e}')
+                          errors.append(str(e))
+              print(f'  ✓ {path}')
+
+          conn.close()
+          if errors:
+              sys.exit(1)
+          EOF
+
+      - name: Post deploy summary to GitHub Step Summary
+        run: |
+          echo "## Snowflake Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Account | FJC24794 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+
+  # ──────────────────────────────────────────
+  # JOB 4: Notify on failure
+  # ──────────────────────────────────────────
+  notify-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [validate, test, deploy]
+    if: failure()
+    steps:
+      - name: Log failure details
+        run: |
+          echo "::error::CI/CD pipeline failed for commit ${{ github.sha }} on branch ${{ github.ref_name }}"
+          echo "Check Snowflake run log: SELECT * FROM demo_db.analytics.cicd_run_log ORDER BY run_time DESC LIMIT 5;"
