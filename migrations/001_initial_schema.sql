@@ -2,9 +2,6 @@
 -- Applied by: CI/CD pipeline on deploy
 -- Run order : 001 (first)
 
-USE ROLE DEVELOPER_ROLE;
-USE DATABASE DEMO_DB;
-USE SCHEMA DEMO_DB.RAW;
 
 CREATE TABLE IF NOT EXISTS demo_db.raw.orders (
     order_id    NUMBER        NOT NULL,

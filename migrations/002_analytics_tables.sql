@@ -2,8 +2,6 @@
 -- Applied by: CI/CD pipeline on deploy
 -- Depends on: 001_initial_schema.sql
 
-USE ROLE DEVELOPER_ROLE;
-USE DATABASE DEMO_DB;
 
 CREATE TABLE IF NOT EXISTS demo_db.analytics.cicd_run_log (
     run_id        NUMBER AUTOINCREMENT PRIMARY KEY,
@@ -28,5 +26,3 @@ CREATE TABLE IF NOT EXISTS demo_db.analytics.customer_summary (
     updated_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 );
 
-GRANT SELECT ON TABLE demo_db.analytics.cicd_run_log  TO ROLE ANALYST_ROLE;
-GRANT SELECT ON TABLE demo_db.analytics.customer_summary TO ROLE ANALYST_ROLE;
