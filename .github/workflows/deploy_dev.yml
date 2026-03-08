@@ -20,7 +20,7 @@ env:
   SF_WAREHOUSE : DEV_WH
   SF_DATABASE  : DEV_DB
   SF_SCHEMA    : ANALYTICS
-  SF_ROLE      : DEV_ROLE
+  SF_ROLE      : SYSADMIN
   ENVIRONMENT  : DEV
   BRANCH       : develop
 
