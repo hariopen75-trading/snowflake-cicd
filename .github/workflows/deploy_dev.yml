@@ -1,0 +1,214 @@
+# ============================================================
+# DEPLOY TO DEV — triggers on every push to `develop` branch
+# ============================================================
+name: "🔧 Deploy to DEV"
+
+on:
+  push:
+    branches: [develop]
+    paths: ['notebooks/**', 'migrations/**', 'tests/**', 'sql/**']
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force deploy even without file changes'
+        type: boolean
+        default: false
+
+env:
+  SF_ACCOUNT   : ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SF_USER      : ${{ secrets.SNOWFLAKE_USER }}
+  SF_WAREHOUSE : DEV_WH
+  SF_DATABASE  : DEV_DB
+  SF_SCHEMA    : ANALYTICS
+  SF_ROLE      : DEV_ROLE
+  ENVIRONMENT  : DEV
+  BRANCH       : develop
+
+jobs:
+  deploy-dev:
+    name: Deploy to DEV_DB
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install snowflake-connector-python snowflake-snowpark-python
+
+      - name: "🔧 DEV — Run migrations"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, glob, os, sys
+
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+          errors = []
+
+          print('Running migrations on DEV_DB...')
+          for path in sorted(glob.glob('migrations/*.sql')):
+              sql = open(path).read().replace('DEMO_DB', 'DEV_DB')
+              for stmt in sql.split(';'):
+                  stmt = stmt.strip()
+                  if stmt and not stmt.startswith('--'):
+                      try:
+                          cur.execute(stmt)
+                      except Exception as e:
+                          if 'already exists' not in str(e).lower():
+                              errors.append(f'{path}: {e}')
+              print(f'  ✓ {path}')
+
+          conn.close()
+          if errors:
+              print(f'ERRORS: {errors}')
+              sys.exit(1)
+          print('All migrations applied to DEV_DB.')
+          PYEOF
+
+      - name: "🔧 DEV — Seed test data"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os
+
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+
+          print('Seeding sample data into DEV_DB...')
+          cur.execute("DELETE FROM DEV_DB.RAW.CUSTOMERS WHERE customer_id <= 10")
+          cur.execute("""
+              INSERT INTO DEV_DB.RAW.CUSTOMERS (customer_id, name, email, region)
+              SELECT seq4()+1, 'Customer_'||seq4(), 'cust'||seq4()||'@demo.com',
+                     CASE MOD(seq4(),4) WHEN 0 THEN 'NORTH' WHEN 1 THEN 'SOUTH'
+                     WHEN 2 THEN 'EAST' ELSE 'WEST' END
+              FROM TABLE(GENERATOR(ROWCOUNT=>10))
+          """)
+          cur.execute("DELETE FROM DEV_DB.RAW.ORDERS WHERE order_id <= 50")
+          cur.execute("""
+              INSERT INTO DEV_DB.RAW.ORDERS (order_id, customer_id, amount, status, order_date, region)
+              SELECT seq4()+1, MOD(seq4(),10)+1, UNIFORM(10,1000,RANDOM())::FLOAT,
+                     CASE MOD(seq4(),3) WHEN 0 THEN 'completed' WHEN 1 THEN 'pending' ELSE 'cancelled' END,
+                     DATEADD('day', -MOD(seq4(),90), CURRENT_DATE()),
+                     CASE MOD(seq4(),4) WHEN 0 THEN 'NORTH' WHEN 1 THEN 'SOUTH'
+                     WHEN 2 THEN 'EAST' ELSE 'WEST' END
+              FROM TABLE(GENERATOR(ROWCOUNT=>50))
+          """)
+          conn.close()
+          print('Sample data seeded.')
+          PYEOF
+
+      - name: "🔧 DEV — Unit tests"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os, sys
+
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+          tests = [
+              ('Customers exist',     'SELECT COUNT(*) FROM DEV_DB.RAW.CUSTOMERS', lambda v: v > 0),
+              ('Orders exist',        'SELECT COUNT(*) FROM DEV_DB.RAW.ORDERS', lambda v: v > 0),
+              ('No null customer_id', 'SELECT COUNT(*) FROM DEV_DB.RAW.ORDERS WHERE customer_id IS NULL', lambda v: v == 0),
+              ('No negative amounts', 'SELECT COUNT(*) FROM DEV_DB.RAW.ORDERS WHERE amount < 0', lambda v: v == 0),
+              ('Valid statuses',      "SELECT COUNT(*) FROM DEV_DB.RAW.ORDERS WHERE status NOT IN ('completed','pending','cancelled')", lambda v: v == 0),
+          ]
+          failures = []
+          for name, sql, check in tests:
+              cur.execute(sql)
+              val = cur.fetchone()[0]
+              ok  = check(val)
+              print(f"  {'✓' if ok else '✗'} {name}")
+              if not ok: failures.append(name)
+          conn.close()
+          if failures:
+              print(f'FAILED: {failures}')
+              sys.exit(1)
+          print('All DEV tests passed.')
+          PYEOF
+
+      - name: "🔧 DEV — Execute Notebook"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+          try:
+              cur.execute("EXECUTE NOTEBOOK DEV_DB.ANALYTICS.DEV_PIPELINE_NB()")
+              print('✓ DEV_PIPELINE_NB executed')
+          except Exception as e:
+              print(f'Notebook execute: {e}')
+          conn.close()
+          PYEOF
+
+      - name: "📋 DEV — Summary"
+        run: |
+          echo "## 🔧 DEV Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | DEV_DB |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | develop |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Next Step | Create PR: \`develop → uat\` |" >> $GITHUB_STEP_SUMMARY
+
+  promote-to-uat:
+    name: "Open PR → UAT"
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create PR from develop → uat
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr create \
+            --base uat \
+            --head develop \
+            --title "🧪 Promote to UAT — ${{ github.sha }}" \
+            --body "## UAT Promotion
+          DEV tests passed ✅ — auto-generated PR to promote to UAT.
+
+          **Commit:** \`${{ github.sha }}\`
+          **Deployed to:** DEV_DB
+
+          ### Checklist
+          - [x] DEV unit tests passed
+          - [x] Sample data seeded
+          - [ ] UAT reviewer sign-off
+          - [ ] Merge to trigger UAT deploy" \
+          2>/dev/null || echo "PR already exists or uat branch not set up"

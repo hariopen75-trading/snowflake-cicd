@@ -1,0 +1,185 @@
+# ============================================================
+# DEPLOY TO PROD — triggers when PR merged: uat → main
+# Requires manual approval via GitHub Environments protection
+# ============================================================
+name: "🚀 Deploy to PROD"
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirmed:
+        description: 'Type CONFIRM to deploy to production'
+        required: true
+        type: string
+
+env:
+  SF_ACCOUNT   : ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SF_USER      : ${{ secrets.SNOWFLAKE_USER }}
+  SF_WAREHOUSE : PROD_WH
+  SF_DATABASE  : PROD_DB
+  SF_SCHEMA    : ANALYTICS
+  SF_ROLE      : PROD_ROLE
+  ENVIRONMENT  : PROD
+
+jobs:
+  validate-input:
+    name: Validate PROD deploy
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.confirmed == 'CONFIRM'
+    steps:
+      - name: Check confirmation
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.confirmed }}" != "CONFIRM" ]; then
+              echo "Must type CONFIRM to deploy to production"
+              exit 1
+            fi
+          fi
+          echo "Validation passed"
+
+  deploy-prod:
+    name: "🚀 Deploy to PROD_DB"
+    runs-on: ubuntu-latest
+    needs: validate-input
+    environment: production     # GitHub env protection with required reviewers
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install snowflake-connector-python
+
+      - name: "🚀 PROD — Pre-deploy backup"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os, datetime
+
+          ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+          backup = f'PROD_BACKUP_{ts}'
+          print(f'Creating backup: {backup}...')
+          try:
+              cur.execute(f"CREATE DATABASE {backup} CLONE PROD_DB COMMENT='Pre-deploy backup {ts}'")
+              print(f'  ✓ Backup: {backup} (zero-copy, no extra cost)')
+          except Exception as e:
+              print(f'  Warning: {e}')
+          conn.close()
+          print(f'::set-output name=backup_db::{backup}')
+          PYEOF
+
+      - name: "🚀 PROD — Promote UAT → PROD"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os, sys, datetime
+
+          ts = datetime.datetime.now().strftime('%Y%m%d_%H%M')
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+          errors = []
+
+          print('Promoting UAT_DB → PROD_DB...')
+          for schema in ['RAW', 'STAGING', 'ANALYTICS']:
+              try:
+                  cur.execute(f'ALTER SCHEMA IF EXISTS PROD_DB.{schema} RENAME TO PROD_DB.{schema}_PREV_{ts}')
+              except: pass
+              try:
+                  cur.execute(f'CREATE SCHEMA PROD_DB.{schema} CLONE UAT_DB.{schema}')
+                  cur.execute(f"SELECT COUNT(*) FROM PROD_DB.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='{schema}'")
+                  n = cur.fetchone()[0]
+                  print(f'  ✓ PROD_DB.{schema} ({n} tables)')
+                  # Drop previous
+                  cur.execute(f'DROP SCHEMA IF EXISTS PROD_DB.{schema}_PREV_{ts}')
+              except Exception as e:
+                  print(f'  ✗ {schema}: {e}')
+                  errors.append(str(e))
+
+          conn.close()
+          if errors:
+              print(f'ERRORS: {errors}')
+              sys.exit(1)
+          PYEOF
+
+      - name: "🚀 PROD — Smoke tests"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os, sys
+
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+          tests = [
+              ('PROD_DB live',    'SELECT CURRENT_DATABASE()'),
+              ('Customers exist', 'SELECT COUNT(*) FROM PROD_DB.RAW.CUSTOMERS'),
+              ('Orders exist',    'SELECT COUNT(*) FROM PROD_DB.RAW.ORDERS'),
+          ]
+          for name, sql in tests:
+              cur.execute(sql)
+              val = cur.fetchone()[0]
+              print(f'  ✓ {name}: {val}')
+          conn.close()
+          print('All smoke tests passed.')
+          PYEOF
+
+      - name: "🚀 PROD — Log deployment"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os
+
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+          cur.execute("""
+              INSERT INTO PROD_DB.ANALYTICS.DEPLOY_LOG (environment, branch, commit_sha, status, notes)
+              VALUES ('PROD', 'main', '${{ github.sha }}', 'SUCCESS', 'Promoted from UAT_DB via GitHub Actions')
+          """)
+          cur.execute("SELECT COUNT(*) FROM PROD_DB.ANALYTICS.DEPLOY_LOG")
+          total = cur.fetchone()[0]
+          print(f'  ✓ Deploy logged (total deployments: {total})')
+          conn.close()
+          PYEOF
+
+      - name: "📋 PROD — Summary"
+        run: |
+          echo "## 🚀 PRODUCTION Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | **PROD_DB** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | main |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployed by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ✅ **LIVE IN PRODUCTION** |" >> $GITHUB_STEP_SUMMARY

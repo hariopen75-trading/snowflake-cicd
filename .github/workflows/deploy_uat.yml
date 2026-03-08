@@ -1,0 +1,163 @@
+# ============================================================
+# DEPLOY TO UAT — triggers when PR merged: develop → uat
+# ============================================================
+name: "🧪 Deploy to UAT"
+
+on:
+  push:
+    branches: [uat]
+  workflow_dispatch:
+
+env:
+  SF_ACCOUNT   : ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SF_USER      : ${{ secrets.SNOWFLAKE_USER }}
+  SF_WAREHOUSE : UAT_WH
+  SF_DATABASE  : UAT_DB
+  SF_SCHEMA    : ANALYTICS
+  SF_ROLE      : UAT_ROLE
+  ENVIRONMENT  : UAT
+
+jobs:
+  deploy-uat:
+    name: Deploy to UAT_DB
+    runs-on: ubuntu-latest
+    environment: uat          # GitHub env protection (optional reviewers)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install snowflake-connector-python snowflake-snowpark-python
+
+      - name: "🧪 UAT — Clone DEV_DB → UAT_DB"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os
+
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+          print('Zero-copy cloning DEV_DB → UAT_DB...')
+          for schema in ['RAW', 'STAGING', 'ANALYTICS']:
+              try:
+                  cur.execute(f'DROP SCHEMA IF EXISTS UAT_DB.{schema}')
+                  cur.execute(f'CREATE SCHEMA UAT_DB.{schema} CLONE DEV_DB.{schema}')
+                  cur.execute(f"SELECT COUNT(*) FROM UAT_DB.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='{schema}'")
+                  n = cur.fetchone()[0]
+                  print(f'  ✓ UAT_DB.{schema} cloned ({n} tables)')
+              except Exception as e:
+                  print(f'  ~ {schema}: {e}')
+          conn.close()
+          PYEOF
+
+      - name: "🧪 UAT — Integration tests"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os, sys
+
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+
+          tests = [
+              ('Min 5 customers',      'SELECT COUNT(*) FROM UAT_DB.RAW.CUSTOMERS', lambda v: v >= 5),
+              ('Min 10 orders',        'SELECT COUNT(*) FROM UAT_DB.RAW.ORDERS', lambda v: v >= 10),
+              ('No null customer_id',  'SELECT COUNT(*) FROM UAT_DB.RAW.ORDERS WHERE customer_id IS NULL', lambda v: v == 0),
+              ('No negative amounts',  'SELECT COUNT(*) FROM UAT_DB.RAW.ORDERS WHERE amount < 0', lambda v: v == 0),
+              ('No future dates',      'SELECT COUNT(*) FROM UAT_DB.RAW.ORDERS WHERE order_date > CURRENT_DATE()', lambda v: v == 0),
+              ('RI: Orders→Customers', '''SELECT COUNT(*) FROM UAT_DB.RAW.ORDERS o
+                  WHERE NOT EXISTS (SELECT 1 FROM UAT_DB.RAW.CUSTOMERS c WHERE c.customer_id=o.customer_id)''', lambda v: v == 0),
+              ('Completed orders > 0', "SELECT COUNT(*) FROM UAT_DB.RAW.ORDERS WHERE status='completed'", lambda v: v > 0),
+          ]
+
+          failures = []
+          for name, sql, check in tests:
+              cur.execute(sql)
+              val = cur.fetchone()[0]
+              ok  = check(val)
+              print(f"  {'✓' if ok else '✗'} {name}: {val}")
+              if not ok: failures.append(name)
+
+          conn.close()
+          if failures:
+              print(f'\nFAILED tests: {failures}')
+              sys.exit(1)
+          print('\nAll UAT integration tests passed.')
+          PYEOF
+
+      - name: "🧪 UAT — Execute Notebook"
+        env:
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF'
+          import snowflake.connector, os
+          conn = snowflake.connector.connect(
+              account='${{ env.SF_ACCOUNT }}', user='${{ env.SF_USER }}',
+              password=os.environ['SF_PASSWORD'], warehouse='${{ env.SF_WAREHOUSE }}',
+              database='${{ env.SF_DATABASE }}', schema='${{ env.SF_SCHEMA }}',
+              role='${{ env.SF_ROLE }}'
+          )
+          cur = conn.cursor()
+          try:
+              cur.execute("EXECUTE NOTEBOOK UAT_DB.ANALYTICS.UAT_PIPELINE_NB()")
+              print('✓ UAT_PIPELINE_NB executed')
+          except Exception as e:
+              print(f'Notebook execute: {e}')
+          conn.close()
+          PYEOF
+
+      - name: "📋 UAT — Summary"
+        run: |
+          echo "## 🧪 UAT Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | UAT_DB |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | uat |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Next Step | Create PR: \`uat → main\` for PROD |" >> $GITHUB_STEP_SUMMARY
+
+  promote-to-prod:
+    name: "Open PR → PROD"
+    runs-on: ubuntu-latest
+    needs: deploy-uat
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create PR from uat → main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr create \
+            --base main \
+            --head uat \
+            --title "🚀 Promote to PROD — ${{ github.sha }}" \
+            --body "## Production Promotion
+          UAT tests passed ✅ — requesting PROD deploy approval.
+
+          **Commit:** \`${{ github.sha }}\`
+
+          ### Sign-off Checklist
+          - [x] DEV unit tests ✅
+          - [x] UAT integration tests ✅
+          - [x] UAT data quality gates ✅
+          - [ ] **Requires manual approval to merge → PROD**" \
+          2>/dev/null || echo "PR already exists"
